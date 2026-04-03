@@ -133,6 +133,7 @@ PLATFORMS
   x86_64-linux-musl
 
 DEPENDENCIES
+  oj
   pg
   polygonio!
   redis

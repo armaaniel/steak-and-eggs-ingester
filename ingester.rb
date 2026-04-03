@@ -1,4 +1,5 @@
 require "redis"
+require "oj"
 require "polygonio"
 require "pg"
 require "sentry-ruby"
