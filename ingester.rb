@@ -63,7 +63,7 @@ loop do
   loop do
     sleep(60)
     break unless subscriber.alive?
-    break if market_open?(tz) && Time.now - last_message_at > 300
+    break if market_open?(tz) && Time.now - last_message_at > 120
   end
 
   subscriber.kill
