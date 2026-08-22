@@ -1,3 +1,16 @@
+require "redis"
+require "oj"
+require "polygonio"
+require "pg"
+require "sentry-ruby"
+require "tzinfo"
+
+Sentry.init { |config| config.dsn = ENV["SENTRY_DSN"] }
+
+REDIS_URL = ENV.fetch("REDIS_URL")
+DATABASE_URL = ENV.fetch("DATABASE_URL")
+API_KEY = ENV.fetch("API_KEY")
+
 SIX_DAYS        = 518_400
 SAMPLE_INTERVAL = 60
 STALE_AFTER     = 120
