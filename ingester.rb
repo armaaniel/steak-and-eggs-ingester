@@ -325,5 +325,11 @@ loop do
     error: STATE.last_error
   }.compact)
 
+  # cleared only after the teardown sample, which still needs to carry the id so the
+  # connection has a recorded end. Samples written during the backoff belong to no
+  # connection, and leaving the old id set would keep crediting them to a dead one —
+  # unbounded if a reconnect ever wedges.
+  STATE.connection_id = nil
+
   sleep(BACKOFF)
 end
