@@ -59,7 +59,7 @@ REDIS_OPTS = {
 INSERT_SAMPLE = <<~SQL.freeze
   INSERT INTO ingester_samples
     (at, boot_id, connection_id, kind, state, cause,
-     frames, events, symbols, max_lag_ms, sum_lag_ms, lagged_events,
+     frames, events, symbols, max_lag_ms, sum_lag_ms, sampled_events,
      last_message_at, first_message_at, detail)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 SQL
@@ -79,7 +79,7 @@ EARLY_CLOSES = Set.new(%w[
 State = Struct.new(
   :boot_id, :connection_id, :subscriber, :shutting_down, :backoff,
   :connected_at, :last_message_at, :first_message_at, :last_error,
-  :frames, :events, :max_lag_ms, :sum_lag_ms, :lagged_events, :symbols,
+  :frames, :events, :max_lag_ms, :sum_lag_ms, :sampled_events, :symbols,
   keyword_init: true
 )
 
@@ -91,7 +91,7 @@ STATE = State.new(
   events: 0,
   max_lag_ms: 0,
   sum_lag_ms: 0,
-  lagged_events: 0,
+  sampled_events: 0,
   symbols: Set.new
 )
 
@@ -132,17 +132,17 @@ def derive_state
 end
 
 def write_sample!(kind = 'tick', cause: nil, detail: nil)
-  lag = seen = params = sum = lagged nil
+  lag = seen = params = sum = sampled = nil
 
   SAMPLE_LOCK.synchronize do
     lag    = STATE.max_lag_ms
     sum    = STATE.sum_lag_ms
-    lagged = STATE.lagged_events
+    sampled = STATE.sampled_events
     seen   = STATE.symbols
 
     STATE.max_lag_ms    = 0
     STATE.sum_lag_ms    = 0
-    STATE.lagged_events = 0
+    STATE.sampled_events = 0
     STATE.symbols       = Set.new
 
     params = [
@@ -157,7 +157,7 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
       seen.size,
       lag,
       sum,
-      lagged,
+      sampled,
       STATE.last_message_at,
       STATE.first_message_at,
       detail && JSON.generate(detail)
@@ -177,7 +177,7 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
     SAMPLE_LOCK.synchronize do
       STATE.max_lag_ms     = lag if lag > STATE.max_lag_ms
       STATE.sum_lag_ms    += sum
-      STATE.lagged_events += lagged
+      STATE.sampled_events += sampled
       STATE.symbols.merge(seen)
     end
     Sentry.capture_exception(e, extra: {
@@ -265,7 +265,7 @@ loop do
             lag_ms = ((now.to_f - (data.e / 1000.0)) * 1000).to_i
             STATE.max_lag_ms = lag_ms if lag_ms > STATE.max_lag_ms
             STATE.sum_lag_ms += lag_ms
-            STATE.lagged_events += 1
+            STATE.sampled_events += 1
             STATE.symbols << data.sym
             
             if data.c.to_f > 0
