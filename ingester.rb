@@ -4,12 +4,17 @@ require "polygonio"
 require "pg"
 require "sentry-ruby"
 require "tzinfo"
+require "uri"
+require "json"
+require "set"
+require "time"
+require "securerandom"
 
 Sentry.init { |config| config.dsn = ENV["SENTRY_DSN"] }
 
-REDIS_URL = ENV.fetch("REDIS_URL")
+REDIS_URL    = ENV.fetch("REDIS_URL")
 DATABASE_URL = ENV.fetch("DATABASE_URL")
-API_KEY = ENV.fetch("API_KEY")
+API_KEY      = ENV.fetch("API_KEY")
 
 SIX_DAYS        = 518_400
 SAMPLE_INTERVAL = 60
@@ -17,32 +22,46 @@ STALE_AFTER     = 120
 BACKOFF         = 60
 JOIN_TIMEOUT    = 10
 
-TZ = TZInfo::Timezone.get('America/New_York')
+TZ = TZInfo::Timezone.get("America/New_York")
 
-PG_OPTS = {
-  dbname: ENV['DATABASE_URL'],
-  connect_timeout: 2,
-  options: '-c statement_timeout=2000 -c application_name=ingester'
+DB_URI = URI.parse(DATABASE_URL)
+
+BASE_PG_OPTS = {
+  host:     DB_URI.host,
+  port:     DB_URI.port || 5432,
+  dbname:   DB_URI.path.delete_prefix("/"),
+  user:     DB_URI.user     && URI::DEFAULT_PARSER.unescape(DB_URI.user),
+  password: DB_URI.password && URI::DEFAULT_PARSER.unescape(DB_URI.password),
+
+  connect_timeout:     2,
+  keepalives:          1,
+  keepalives_idle:     10,
+  keepalives_interval: 5,
+  keepalives_count:    3
 }.freeze
 
-BOOT_PG_OPTS = PG_OPTS.merge(
-  options: '-c statement_timeout=15000 -c application_name=ingester-boot'
+PG_OPTS = BASE_PG_OPTS.merge(
+  options: "-c statement_timeout=2000 -c application_name=ingester"
+).freeze
+
+BOOT_PG_OPTS = BASE_PG_OPTS.merge(
+  options: "-c statement_timeout=15000 -c application_name=ingester-boot"
 ).freeze
 
 REDIS_OPTS = {
-  url: ENV['REDIS_URL'],
-  ssl: true,
+  url:           REDIS_URL,
+  ssl:           true,
   connect_timeout: 5,
-  read_timeout: 2,
+  read_timeout:  2,
   write_timeout: 2
 }.freeze
 
 INSERT_SAMPLE = <<~SQL.freeze
   INSERT INTO ingester_samples
     (at, boot_id, connection_id, kind, state, cause,
-     frames, events, symbols, max_lag_ms,
+     frames, events, symbols, max_lag_ms, sum_lag_ms, lagged_events,
      last_message_at, first_message_at, detail)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 SQL
 
 HOLIDAYS = Set.new(%w[
@@ -60,7 +79,7 @@ EARLY_CLOSES = Set.new(%w[
 State = Struct.new(
   :boot_id, :connection_id, :subscriber, :shutting_down, :backoff,
   :connected_at, :last_message_at, :first_message_at, :last_error,
-  :frames, :events, :max_lag_ms, :symbols,
+  :frames, :events, :max_lag_ms, :sum_lag_ms, :lagged_events, :symbols,
   keyword_init: true
 )
 
@@ -71,6 +90,8 @@ STATE = State.new(
   frames: 0,
   events: 0,
   max_lag_ms: 0,
+  sum_lag_ms: 0,
+  lagged_events: 0,
   symbols: Set.new
 )
 
@@ -82,12 +103,6 @@ def fetch_tickers
   db.exec('SELECT symbol FROM tickers').map { |row| row['symbol'] }
 ensure
   db&.close
-end
-
-def report(e, **extra)
-  Sentry.capture_exception(e, extra: extra)
-rescue Exception
-  warn("sentry failed: #{e.class}: #{e.message}")
 end
 
 def market_open?
@@ -117,13 +132,18 @@ def derive_state
 end
 
 def write_sample!(kind = 'tick', cause: nil, detail: nil)
-  lag = seen = params = nil
+  lag = seen = params = sum = lagged nil
 
   SAMPLE_LOCK.synchronize do
-    lag  = STATE.max_lag_ms
-    seen = STATE.symbols
-    STATE.max_lag_ms = 0
-    STATE.symbols    = Set.new
+    lag    = STATE.max_lag_ms
+    sum    = STATE.sum_lag_ms
+    lagged = STATE.lagged_events
+    seen   = STATE.symbols
+
+    STATE.max_lag_ms    = 0
+    STATE.sum_lag_ms    = 0
+    STATE.lagged_events = 0
+    STATE.symbols       = Set.new
 
     params = [
       Time.now.utc,
@@ -136,6 +156,8 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
       STATE.events,
       seen.size,
       lag,
+      sum,
+      lagged,
       STATE.last_message_at,
       STATE.first_message_at,
       detail && JSON.generate(detail)
@@ -153,7 +175,9 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
     db.exec_params(INSERT_SAMPLE, params)
   rescue => e
     SAMPLE_LOCK.synchronize do
-      STATE.max_lag_ms = lag if lag > STATE.max_lag_ms
+      STATE.max_lag_ms     = lag if lag > STATE.max_lag_ms
+      STATE.sum_lag_ms    += sum
+      STATE.lagged_events += lagged
       STATE.symbols.merge(seen)
     end
     Sentry.capture_exception(e, extra: {
@@ -221,11 +245,9 @@ loop do
     last_epoch = {}
 
     begin
-      client = Polygonio::Websocket::Client.new('stocks', ENV['API_KEY'], delayed: true)
+      client = Polygonio::Websocket::Client.new('stocks', API_KEY, delayed: true)
 
       client.subscribe(symbols) do |message|
-        # one frame: an array of per-symbol 1s aggregates, batched by Polygon —
-        # one entry for each subscribed symbol that traded in that second
         now = Time.now
         STATE.first_message_at = now if STATE.last_message_at.nil?
         STATE.last_message_at  = now
@@ -242,6 +264,8 @@ loop do
 
             lag_ms = ((now.to_f - (data.e / 1000.0)) * 1000).to_i
             STATE.max_lag_ms = lag_ms if lag_ms > STATE.max_lag_ms
+            STATE.sum_lag_ms += lag_ms
+            STATE.lagged_events += 1
             STATE.symbols << data.sym
             
             if data.c.to_f > 0
@@ -249,7 +273,7 @@ loop do
               pipe.publish("price_channel:#{data.sym}", data.c.to_json)
             end
             
-            if data.op.to_f
+            if data.op.to_f > 0
               pipe.setex("open:#{data.sym}", SIX_DAYS, data.op)
             end
             
