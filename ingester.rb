@@ -78,7 +78,7 @@ EARLY_CLOSES = Set.new(%w[
 
 State = Struct.new(
   :boot_id, :connection_id, :subscriber, :shutting_down, :backoff,
-  :connected_at, :last_message_at, :first_message_at, :last_error,
+  :connected_at, :last_message_at, :first_message_at, :last_error, :force_disconnect,
   :frames, :events, :max_lag_ms, :sum_lag_ms, :sampled_events, :symbols,
   keyword_init: true
 )
@@ -239,6 +239,7 @@ loop do
   STATE.last_message_at  = nil
   STATE.first_message_at = nil
   STATE.last_error       = nil
+  STATE.force_disconnect = false
 
   subscriber = Thread.new do
     redis      = Redis.new(REDIS_OPTS)
@@ -281,8 +282,12 @@ loop do
         end
       end
     rescue => e
-      STATE.last_error = { class: e.class.name, message: e.message }
-      Sentry.capture_exception(e)
+      if e.is_a?(Dry::Struct::Error) && e.message.include?('force_disconnect')
+        STATE.force_disconnect = true
+      else
+        STATE.last_error = { class: e.class.name, message: e.message }
+        Sentry.capture_exception(e)
+      end
     ensure
       begin
         redis.close
@@ -303,6 +308,8 @@ loop do
 
   reason = if subscriber.alive?
              'stale'
+           elsif STATE.force_disconnect
+             'force_disconnect'
            elsif STATE.last_error
              'error'
            else
