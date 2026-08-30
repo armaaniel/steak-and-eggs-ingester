@@ -59,9 +59,9 @@ REDIS_OPTS = {
 INSERT_SAMPLE = <<~SQL.freeze
   INSERT INTO ingester_samples
     (at, boot_id, connection_id, kind, state, cause,
-     frames, events, symbols, max_lag_ms, sum_lag_ms, sampled_events,
+     frames, events, symbols, sum_lag_ms, sampled_events,
      last_message_at, first_message_at, detail)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 SQL
 
 HOLIDAYS = Set.new(%w[
@@ -79,7 +79,7 @@ EARLY_CLOSES = Set.new(%w[
 State = Struct.new(
   :boot_id, :connection_id, :subscriber, :shutting_down, :backoff,
   :connected_at, :last_message_at, :first_message_at, :last_error, :force_disconnect,
-  :frames, :events, :max_lag_ms, :sum_lag_ms, :sampled_events, :symbols,
+  :frames, :events, :sum_lag_ms, :sampled_events, :symbols,
   keyword_init: true
 )
 
@@ -89,7 +89,6 @@ STATE = State.new(
   backoff: false,
   frames: 0,
   events: 0,
-  max_lag_ms: 0,
   sum_lag_ms: 0,
   sampled_events: 0,
   symbols: Set.new
@@ -132,15 +131,13 @@ def derive_state
 end
 
 def write_sample!(kind = 'tick', cause: nil, detail: nil)
-  lag = seen = params = sum = sampled = nil
+  seen = params = sum = sampled = nil
 
   SAMPLE_LOCK.synchronize do
-    lag    = STATE.max_lag_ms
     sum    = STATE.sum_lag_ms
     sampled = STATE.sampled_events
     seen   = STATE.symbols
 
-    STATE.max_lag_ms    = 0
     STATE.sum_lag_ms    = 0
     STATE.sampled_events = 0
     STATE.symbols       = Set.new
@@ -155,7 +152,6 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
       STATE.frames,
       STATE.events,
       seen.size,
-      lag,
       sum,
       sampled,
       STATE.last_message_at,
@@ -175,7 +171,6 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
     db.exec_params(INSERT_SAMPLE, params)
   rescue => e
     SAMPLE_LOCK.synchronize do
-      STATE.max_lag_ms     = lag if lag > STATE.max_lag_ms
       STATE.sum_lag_ms    += sum
       STATE.sampled_events += sampled
       STATE.symbols.merge(seen)
@@ -264,7 +259,6 @@ loop do
             last_epoch[data.sym] = data.e
 
             lag_ms = ((now.to_f - (data.e / 1000.0)) * 1000).to_i
-            STATE.max_lag_ms = lag_ms if lag_ms > STATE.max_lag_ms
             STATE.sum_lag_ms += lag_ms
             STATE.sampled_events += 1
             STATE.symbols << data.sym
