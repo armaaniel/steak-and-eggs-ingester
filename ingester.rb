@@ -24,14 +24,14 @@ FEED_DELAY      = 900
 
 TZ = TZInfo::Timezone.get("America/New_York")
 
-DB_URI = URI.parse(DATABASE_URL)
+DB = URI.parse(DATABASE_URL)
 
 BASE_PG_OPTS = {
-  host:     DB_URI.host,
-  port:     DB_URI.port || 5432,
-  dbname:   DB_URI.path.delete_prefix("/"),
-  user:     DB_URI.user     && URI::DEFAULT_PARSER.unescape(DB_URI.user),
-  password: DB_URI.password && URI::DEFAULT_PARSER.unescape(DB_URI.password),
+  host:     DB.host,
+  port:     DB.port,
+  dbname:   DB.path.delete_prefix("/"),
+  user:     DB.user,
+  password: DB.password,
 
   connect_timeout:     2,
   keepalives:          1,
