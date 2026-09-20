@@ -34,10 +34,6 @@ BASE_PG_OPTS = {
   password: DB.password,
 
   connect_timeout:     2,
-  keepalives:          1,
-  keepalives_idle:     10,
-  keepalives_interval: 5,
-  keepalives_count:    3
 }.freeze
 
 PG_OPTS = BASE_PG_OPTS.merge(
