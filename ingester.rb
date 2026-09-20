@@ -47,21 +47,37 @@ HOLIDAYS = Set.new(%w[
   2026-06-19 2026-07-03 2026-09-07 2026-11-26 2026-12-25
   2027-01-01 2027-01-18 2027-02-15 2027-03-26 2027-05-31
   2027-06-18 2027-07-05 2027-09-06 2027-11-25 2027-12-24
+  2028-01-17 2028-02-21 2028-04-14 2028-05-29 2028-06-19
+  2028-07-04 2028-09-04 2028-11-23 2028-12-25
 ]).freeze
 
 EARLY_CLOSES = Set.new(%w[
   2026-11-27 2026-12-24
   2027-11-26
+  2028-07-03 2028-11-24
 ]).freeze
 
-State = Struct.new(
-  :boot_id, :connection_id, :subscriber, :shutting_down, :backoff,
-  :connected_at, :last_message_at, :first_message_at, :last_error, :force_disconnect,
-  :frames, :events, :sum_lag_ms, :sampled_events, :symbols,
+IngesterState = Struct.new(
+  :boot_id,
+  :connection_id,
+  :last_message_at,
+  :first_message_at,
+  :last_error,
+  :frames,
+  :events,
+  :sum_lag_ms,
+  :sampled_events,
+  :symbols,
+  
+  :backoff,
+  :subscriber,
+  :shutting_down,
+  :force_disconnect,
+  :connected_at,
   keyword_init: true
 )
 
-STATE = State.new(
+STATE = IngesterState.new(
   boot_id: SecureRandom.uuid,
   shutting_down: false,
   backoff: false,
@@ -72,7 +88,7 @@ STATE = State.new(
   symbols: Set.new
 )
 
-SAMPLE_LOCK = Mutex.new
+WRITE_SAMPLE_LOCK = Mutex.new
 
 def fetch_tickers
   db = nil
@@ -111,10 +127,10 @@ end
 def write_sample!(kind = 'tick', cause: nil, detail: nil)
   row = seen = nil
 
-  SAMPLE_LOCK.synchronize do
+  WRITE_SAMPLE_LOCK.synchronize do
     seen = STATE.symbols
     row = {
-      at:               Time.now.utc.iso8601(6),
+      at:               Time.now.iso8601(6),
       boot_id:          STATE.boot_id,
       connection_id:    STATE.connection_id,
       kind:             kind,
@@ -135,24 +151,21 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
     STATE.sampled_events = 0
   end
 
-  summary = row.slice(:at, :kind, :state, :cause, :boot_id, :connection_id)
-  puts JSON.generate(summary)
-
   columns      = row.keys.join(', ')
-  placeholders = (1..row.size).map { |i| "$#{i}" }.join(', ')
-  sql = "INSERT INTO ingester_samples (#{columns}) VALUES (#{placeholders})"
+  param_markers = (1..row.size).map { |i| "$#{i}" }.join(', ')
+  sql = "INSERT INTO ingester_samples (#{columns}) VALUES (#{param_markers})"
 
   db = nil
   begin
     db = PG.connect(PG_OPTS)
     db.exec_params(sql, row.values)
   rescue => e
-    SAMPLE_LOCK.synchronize do
+    WRITE_SAMPLE_LOCK.synchronize do
       STATE.sum_lag_ms     += row[:sum_lag_ms]
       STATE.sampled_events += row[:sampled_events]
       STATE.symbols.merge(seen)
     end
-    Sentry.capture_exception(e, extra: summary)
+      Sentry.capture_exception(e, extra: row.slice(:at, :kind, :state, :cause, :boot_id, :connection_id))
   ensure
     db&.close
   end
