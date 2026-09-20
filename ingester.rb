@@ -27,12 +27,17 @@ TZ = TZInfo::Timezone.get("America/New_York")
 DB_URI = URI.parse(DATABASE_URL)
 
 BASE_PG_OPTS = {
-  dbname: DATABASE_URL,
-  connect_timeout: 2,
-  keepalives: 1,
-  keepalives_idle: 10,
+  host:     DB_URI.host,
+  port:     DB_URI.port || 5432,
+  dbname:   DB_URI.path.delete_prefix("/"),
+  user:     DB_URI.user     && URI::DEFAULT_PARSER.unescape(DB_URI.user),
+  password: DB_URI.password && URI::DEFAULT_PARSER.unescape(DB_URI.password),
+
+  connect_timeout:     2,
+  keepalives:          1,
+  keepalives_idle:     10,
   keepalives_interval: 5,
-  keepalives_count: 3
+  keepalives_count:    3
 }.freeze
 
 PG_OPTS = BASE_PG_OPTS.merge(
