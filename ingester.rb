@@ -6,7 +6,6 @@ require "sentry-ruby"
 require "tzinfo"
 require "uri"
 require "json"
-require "set"
 require "time"
 require "securerandom"
 
@@ -16,28 +15,24 @@ REDIS_URL    = ENV.fetch("REDIS_URL")
 DATABASE_URL = ENV.fetch("DATABASE_URL")
 API_KEY      = ENV.fetch("API_KEY")
 
-SIX_DAYS        = 518_400
+SIX_DAYS        = 518400
 SAMPLE_INTERVAL = 60
 STALE_AFTER     = 120
 BACKOFF         = 60
 JOIN_TIMEOUT    = 10
+FEED_DELAY      = 900
 
 TZ = TZInfo::Timezone.get("America/New_York")
 
 DB_URI = URI.parse(DATABASE_URL)
 
 BASE_PG_OPTS = {
-  host:     DB_URI.host,
-  port:     DB_URI.port || 5432,
-  dbname:   DB_URI.path.delete_prefix("/"),
-  user:     DB_URI.user     && URI::DEFAULT_PARSER.unescape(DB_URI.user),
-  password: DB_URI.password && URI::DEFAULT_PARSER.unescape(DB_URI.password),
-
-  connect_timeout:     2,
-  keepalives:          1,
-  keepalives_idle:     10,
+  dbname: DATABASE_URL,
+  connect_timeout: 2,
+  keepalives: 1,
+  keepalives_idle: 10,
   keepalives_interval: 5,
-  keepalives_count:    3
+  keepalives_count: 3
 }.freeze
 
 PG_OPTS = BASE_PG_OPTS.merge(
@@ -55,14 +50,6 @@ REDIS_OPTS = {
   read_timeout:  2,
   write_timeout: 2
 }.freeze
-
-INSERT_SAMPLE = <<~SQL.freeze
-  INSERT INTO ingester_samples
-    (at, boot_id, connection_id, kind, state, cause,
-     frames, events, symbols, sum_lag_ms, sampled_events,
-     last_message_at, first_message_at, detail)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-SQL
 
 HOLIDAYS = Set.new(%w[
   2026-01-01 2026-01-19 2026-02-16 2026-04-03 2026-05-25
@@ -104,8 +91,8 @@ ensure
   db&.close
 end
 
-def market_open?
-  now = TZ.now
+def receiving_session_data?
+  now = TZ.to_local(Time.now - FEED_DELAY)
   return false if now.saturday? || now.sunday?
 
   date = now.strftime('%Y-%m-%d')
@@ -124,65 +111,57 @@ def derive_state
 
   since = Time.now - (STATE.last_message_at || STATE.connected_at)
   return 'connecting' if STATE.last_message_at.nil? && since <= STALE_AFTER
-  return 'idle'       unless market_open?
+  return 'idle'       unless receiving_session_data?
   return 'stale'      if since > STALE_AFTER
 
   return 'streaming'
 end
 
 def write_sample!(kind = 'tick', cause: nil, detail: nil)
-  seen = params = sum = sampled = nil
+  row = seen = nil
 
   SAMPLE_LOCK.synchronize do
-    sum    = STATE.sum_lag_ms
-    sampled = STATE.sampled_events
-    seen   = STATE.symbols
+    seen = STATE.symbols
+    row = {
+      at:               Time.now.utc.iso8601(6),
+      boot_id:          STATE.boot_id,
+      connection_id:    STATE.connection_id,
+      kind:             kind,
+      state:            derive_state,
+      cause:            cause,
+      frames:           STATE.frames,
+      events:           STATE.events,
+      symbols:          seen.size,
+      sum_lag_ms:       STATE.sum_lag_ms,
+      sampled_events:   STATE.sampled_events,
+      last_message_at:  STATE.last_message_at&.iso8601(6),
+      first_message_at: STATE.first_message_at&.iso8601(6),
+      detail:           detail && JSON.generate(detail)
+    }
 
-    STATE.sum_lag_ms    = 0
+    STATE.symbols        = Set.new
+    STATE.sum_lag_ms     = 0
     STATE.sampled_events = 0
-    STATE.symbols       = Set.new
-
-    params = [
-      Time.now.utc,
-      STATE.boot_id,
-      STATE.connection_id,
-      kind,
-      derive_state,
-      cause,
-      STATE.frames,
-      STATE.events,
-      seen.size,
-      sum,
-      sampled,
-      STATE.last_message_at,
-      STATE.first_message_at,
-      detail && JSON.generate(detail)
-    ]
   end
 
-  puts JSON.generate(
-    at: params[0].iso8601, kind: params[3], state: params[4],
-    cause: params[5], boot_id: params[1], connection_id: params[2]
-  )
+  summary = row.slice(:at, :kind, :state, :cause, :boot_id, :connection_id)
+  puts JSON.generate(summary)
+
+  columns      = row.keys.join(', ')
+  placeholders = (1..row.size).map { |i| "$#{i}" }.join(', ')
+  sql = "INSERT INTO ingester_samples (#{columns}) VALUES (#{placeholders})"
 
   db = nil
   begin
     db = PG.connect(PG_OPTS)
-    db.exec_params(INSERT_SAMPLE, params)
+    db.exec_params(sql, row.values)
   rescue => e
     SAMPLE_LOCK.synchronize do
-      STATE.sum_lag_ms    += sum
-      STATE.sampled_events += sampled
+      STATE.sum_lag_ms     += row[:sum_lag_ms]
+      STATE.sampled_events += row[:sampled_events]
       STATE.symbols.merge(seen)
     end
-    Sentry.capture_exception(e, extra: {
-      at: params[0].iso8601,
-      boot_id: params[1],
-      connection_id: params[2],
-      kind: params[3],
-      state: params[4],
-      cause: params[5]
-    })
+    Sentry.capture_exception(e, extra: summary)
   ensure
     db&.close
   end
@@ -253,12 +232,11 @@ loop do
 
         redis.pipelined do |pipe|
           message.each do |data|
-            # corrections arrive up to 15 min late; drop anything older than
-            # what we've already written for this symbol
-            next if last_epoch[data.sym] && data.e < last_epoch[data.sym]
+            
+            next if last_epoch[data.sym] && data.e < last_epoch[data.sym] 
             last_epoch[data.sym] = data.e
 
-            lag_ms = ((now.to_f - (data.e / 1000.0)) * 1000).to_i
+            lag_ms = ((now.to_f * 1000) - data.e).to_i
             STATE.sum_lag_ms += lag_ms
             STATE.sampled_events += 1
             STATE.symbols << data.sym
@@ -325,7 +303,6 @@ loop do
     join_timed_out: joined.nil?,
     error: STATE.last_error
   }.compact)
-
 
   STATE.connection_id = nil
   STATE.frames = 0
