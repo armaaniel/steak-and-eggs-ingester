@@ -26,30 +26,20 @@ TZ = TZInfo::Timezone.get("America/New_York")
 
 DB = URI.parse(DATABASE_URL)
 
-BASE_PG_OPTS = {
+PG_OPTS = {
   host:     DB.host,
   port:     DB.port,
   dbname:   DB.path.delete_prefix("/"),
   user:     DB.user,
   password: DB.password,
 
-  connect_timeout:     2,
+  connect_timeout: 2,
+  options:         "-c statement_timeout=10000 -c application_name=ingester"
 }.freeze
-
-PG_OPTS = BASE_PG_OPTS.merge(
-  options: "-c statement_timeout=2000 -c application_name=ingester"
-).freeze
-
-BOOT_PG_OPTS = BASE_PG_OPTS.merge(
-  options: "-c statement_timeout=15000 -c application_name=ingester-boot"
-).freeze
 
 REDIS_OPTS = {
   url:           REDIS_URL,
   ssl:           true,
-  connect_timeout: 5,
-  read_timeout:  2,
-  write_timeout: 2
 }.freeze
 
 HOLIDAYS = Set.new(%w[
@@ -86,7 +76,7 @@ SAMPLE_LOCK = Mutex.new
 
 def fetch_tickers
   db = nil
-  db = PG.connect(BOOT_PG_OPTS)
+  db = PG.connect(PG_OPTS)
   db.exec('SELECT symbol FROM tickers').map { |row| row['symbol'] }
 ensure
   db&.close
