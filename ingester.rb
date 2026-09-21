@@ -17,7 +17,7 @@ API_KEY      = ENV.fetch("API_KEY")
 
 SIX_DAYS        = 518400
 SAMPLE_INTERVAL = 60
-STALE_AFTER     = 120
+STALE_AFTER     = 55
 BACKOFF         = 60
 JOIN_TIMEOUT    = 10
 FEED_DELAY      = 900
@@ -38,8 +38,8 @@ PG_OPTS = {
 }.freeze
 
 REDIS_OPTS = {
-  url:           REDIS_URL,
-  ssl:           true,
+  url: REDIS_URL,
+  ssl: true,
 }.freeze
 
 HOLIDAYS = Set.new(%w[
@@ -60,32 +60,38 @@ EARLY_CLOSES = Set.new(%w[
 IngesterState = Struct.new(
   :boot_id,
   :connection_id,
-  :last_message_at,
   :first_message_at,
+  :last_message_at,
   :last_error,
   :frames,
   :events,
   :sum_lag_ms,
   :sampled_events,
   :symbols,
-  
+  :sum_process_ms,
+  :sum_idle_ms,
+  :last_frame_end_at,
+
   :backoff,
-  :subscriber,
-  :shutting_down,
+  :got_sigterm,
   :force_disconnect,
-  :connected_at,
+  :subscriber,
+  :spawned_at,
   keyword_init: true
 )
 
 STATE = IngesterState.new(
-  boot_id: SecureRandom.uuid,
-  shutting_down: false,
-  backoff: false,
-  frames: 0,
-  events: 0,
-  sum_lag_ms: 0,
-  sampled_events: 0,
-  symbols: Set.new
+  boot_id:          SecureRandom.uuid,
+  got_sigterm:      false,
+  backoff:          false,
+  force_disconnect: false,
+  frames:           0,
+  events:           0,
+  sum_lag_ms:       0,
+  sampled_events:   0,
+  sum_process_ms:   0,
+  sum_idle_ms:      0,
+  symbols:          Set.new
 )
 
 WRITE_SAMPLE_LOCK = Mutex.new
@@ -98,28 +104,28 @@ ensure
   db&.close
 end
 
-def receiving_session_data?
+def session_open?
   now = TZ.to_local(Time.now - FEED_DELAY)
   return false if now.saturday? || now.sunday?
 
   date = now.strftime('%Y-%m-%d')
   return false if HOLIDAYS.include?(date)
 
-  close_hour = EARLY_CLOSES.include?(date) ? 13 : 16
+  close_hour = EARLY_CLOSES.include?(date) ? 17 : 20
   minutes = (now.hour * 60) + now.min
-  minutes >= 570 && minutes < close_hour * 60
+  minutes >= 240 && minutes < close_hour * 60
 end
 
 def derive_state
-  return 'shutdown'   if STATE.shutting_down
+  return 'shutdown'   if STATE.got_sigterm
   return 'backoff'    if STATE.backoff
   return 'booting'    if STATE.subscriber.nil?
   return 'dead'       unless STATE.subscriber.alive?
 
-  since = Time.now - (STATE.last_message_at || STATE.connected_at)
-  return 'connecting' if STATE.last_message_at.nil? && since <= STALE_AFTER
-  return 'idle'       unless receiving_session_data?
-  return 'stale'      if since > STALE_AFTER
+  silence = Time.now - (STATE.last_message_at || STATE.spawned_at)
+  return 'connecting' if STATE.last_message_at.nil? && silence < STALE_AFTER
+  return 'idle'       unless session_open?
+  return 'stale'      if silence > STALE_AFTER
 
   return 'streaming'
 end
@@ -141,6 +147,8 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
       symbols:          seen.size,
       sum_lag_ms:       STATE.sum_lag_ms,
       sampled_events:   STATE.sampled_events,
+      sum_process_ms:   STATE.sum_process_ms,
+      sum_idle_ms:      STATE.sum_idle_ms,
       last_message_at:  STATE.last_message_at&.iso8601(6),
       first_message_at: STATE.first_message_at&.iso8601(6),
       detail:           detail && JSON.generate(detail)
@@ -151,7 +159,7 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
     STATE.sampled_events = 0
   end
 
-  columns      = row.keys.join(', ')
+  columns       = row.keys.join(', ')
   param_markers = (1..row.size).map { |i| "$#{i}" }.join(', ')
   sql = "INSERT INTO ingester_samples (#{columns}) VALUES (#{param_markers})"
 
@@ -165,7 +173,7 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
       STATE.sampled_events += row[:sampled_events]
       STATE.symbols.merge(seen)
     end
-      Sentry.capture_exception(e, extra: row.slice(:at, :kind, :state, :cause, :boot_id, :connection_id))
+    Sentry.capture_exception(e, extra: row.slice(:at, :kind, :state, :cause, :boot_id, :connection_id))
   ensure
     db&.close
   end
@@ -173,16 +181,12 @@ end
 
 shutdown = Queue.new
 Signal.trap('TERM') { shutdown.push(:term) }
-Signal.trap('INT')  { shutdown.push(:term) }
 
 Thread.new do
   shutdown.pop
-  STATE.shutting_down = true
-  begin
-    write_sample!('transition', cause: 'sigterm')
-  rescue Exception => e
-    warn("sigterm sample failed: #{e.class}: #{e.message}")
-  end
+  STATE.got_sigterm = true
+  write_sample!('transition', cause: 'sigterm')
+  Sentry.close
   exit!(0)
 end
 
@@ -212,12 +216,14 @@ write_sample!('transition', cause: 'tickers_fetched', detail: { count: tickers.s
 
 loop do
   STATE.connection_id    = SecureRandom.uuid
-  STATE.connected_at     = Time.now
-  STATE.backoff          = false
   STATE.last_message_at  = nil
   STATE.first_message_at = nil
-  STATE.last_error       = nil
-  STATE.force_disconnect = false
+
+  STATE.spawned_at         = Time.now
+  STATE.backoff            = false
+  STATE.last_error         = nil
+  STATE.force_disconnect   = false
+  STATE.last_frame_end_at  = nil
 
   subscriber = Thread.new do
     redis      = Redis.new(REDIS_OPTS)
@@ -228,6 +234,11 @@ loop do
 
       client.subscribe(symbols) do |message|
         now = Time.now
+
+        if STATE.last_frame_end_at
+          STATE.sum_idle_ms += ((now - STATE.last_frame_end_at) * 1000).to_i
+        end
+
         STATE.first_message_at = now if STATE.last_message_at.nil?
         STATE.last_message_at  = now
 
@@ -236,26 +247,28 @@ loop do
 
         redis.pipelined do |pipe|
           message.each do |data|
-            
-            next if last_epoch[data.sym] && data.e < last_epoch[data.sym] 
+            next if last_epoch[data.sym] && data.e < last_epoch[data.sym]
             last_epoch[data.sym] = data.e
 
             lag_ms = ((now.to_f * 1000) - data.e).to_i
             STATE.sum_lag_ms += lag_ms
             STATE.sampled_events += 1
             STATE.symbols << data.sym
-            
+
             if data.c.to_f > 0
               pipe.setex("price:#{data.sym}", SIX_DAYS, data.c)
               pipe.publish("price_channel:#{data.sym}", data.c.to_json)
             end
-            
+
             if data.op.to_f > 0
               pipe.setex("open:#{data.sym}", SIX_DAYS, data.op)
             end
-            
           end
         end
+
+        finished = Time.now
+        STATE.sum_process_ms    += ((finished - now) * 1000).to_i
+        STATE.last_frame_end_at  = finished
       end
     rescue => e
       if e.is_a?(Dry::Struct::Error) && e.message.include?('force_disconnect')
@@ -293,24 +306,26 @@ loop do
            end
 
   subscriber.kill
-  
+
   joined = begin
-      subscriber.join(JOIN_TIMEOUT)
-    rescue Exception => e
-      STATE.last_error ||= { class: e.class.name, message: e.message }
-      subscriber
-    end
-    
-    
+    subscriber.join(JOIN_TIMEOUT)
+  rescue Exception => e
+    STATE.last_error ||= { class: e.class.name, message: e.message }
+    subscriber
+  end
+
   STATE.backoff = true
   write_sample!('transition', cause: reason, detail: {
     join_timed_out: joined.nil?,
     error: STATE.last_error
   }.compact)
 
-  STATE.connection_id = nil
-  STATE.frames = 0
-  STATE.events = 0
+  STATE.connection_id  = nil
+  STATE.subscriber     = nil
+  STATE.frames         = 0
+  STATE.events         = 0
+  STATE.sum_process_ms = 0
+  STATE.sum_idle_ms    = 0
 
   sleep(BACKOFF)
 end
