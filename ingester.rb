@@ -147,8 +147,8 @@ def write_sample!(kind = 'tick', cause: nil, detail: nil)
       symbols:          seen.size,
       sum_lag_ms:       STATE.sum_lag_ms,
       sampled_events:   STATE.sampled_events,
-      sum_process_ms:   STATE.sum_process_ms,
-      sum_idle_ms:      STATE.sum_idle_ms,
+      sum_process_ms:   STATE.sum_process_ms.round,
+      sum_idle_ms:      STATE.sum_idle_ms.round,
       last_message_at:  STATE.last_message_at&.iso8601(6),
       first_message_at: STATE.first_message_at&.iso8601(6),
       detail:           detail && JSON.generate(detail)
@@ -236,7 +236,7 @@ loop do
         now = Time.now
 
         if STATE.last_frame_end_at
-          STATE.sum_idle_ms += ((now - STATE.last_frame_end_at) * 1000).to_i
+          STATE.sum_idle_ms += (now - STATE.last_frame_end_at) * 1000
         end
 
         STATE.first_message_at = now if STATE.last_message_at.nil?
@@ -267,7 +267,7 @@ loop do
         end
 
         finished = Time.now
-        STATE.sum_process_ms    += ((finished - now) * 1000).to_i
+        STATE.sum_process_ms    += (finished - now) * 1000
         STATE.last_frame_end_at  = finished
       end
     rescue => e
@@ -292,7 +292,7 @@ loop do
   loop do
     sleep(SAMPLE_INTERVAL)
     break unless subscriber.alive?
-    break if derive_state == 'stale'
+    break if derive_state == 'stale' #we can detect this faster if bored, by reducing how long we sleep, and reconnect faster by reducing backoff
   end
 
   reason = if subscriber.alive?
@@ -311,14 +311,12 @@ loop do
     subscriber.join(JOIN_TIMEOUT)
   rescue Exception => e
     STATE.last_error ||= { class: e.class.name, message: e.message }
-    subscriber
+    Sentry.capture_exception(e)
+    nil
   end
 
   STATE.backoff = true
-  write_sample!('transition', cause: reason, detail: {
-    join_timed_out: joined.nil?,
-    error: STATE.last_error
-  }.compact)
+  write_sample!('transition', cause: reason, detail: { join_timed_out: joined.nil?, error: STATE.last_error }.compact)
 
   STATE.connection_id  = nil
   STATE.subscriber     = nil
