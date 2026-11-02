@@ -13,7 +13,7 @@ Mobile app: [steak-and-eggs-mobile](https://github.com/armaaniel/steak-and-eggs-
 
 ## How It Works
 
-1. **Boot.** Read the ticker list from Postgres. Subscribe to Polygon's per-second bars (`A.<symbol>`) for every ticker, on the 15-minute-delayed feed.
+1. **Boot.** Read the ticker list from Postgres. Subscribe to Polygon's per-second bars (`A.<symbol>`) for every ticker not marked delisted, on the 15-minute-delayed feed.
 2. **Each frame.** Polygon sends frames of one or more bars. Each frame gets one Redis pipeline, so it costs one round trip to Valkey however many bars it holds. For every bar, the pipeline sets `price:<symbol>` and `open:<symbol>` with a 6-day TTL and publishes the price to `price_channel:<symbol>`. It skips bars older than the last one seen for that symbol, and zero prices.
 3. **Supervise.** The connection runs in its own thread, and the main loop checks it once a minute. If the thread has died or the connection has gone stale, the loop stops it, records why, waits 60 seconds and opens a new connection.
 
@@ -97,7 +97,7 @@ Because Polygon allows one socket per key, running it with the production key di
 
 ## Trade-offs
 
-- **New tickers wait for a restart.** The ticker list is read once at boot, so the nightly ticker sync only takes effect after the next deploy or restart.
+- **New and delisted tickers wait for a restart.** The ticker list is read once at boot, so the nightly ticker sync only takes effect after the next deploy or restart.
 - **Recovery is slow because it's simple.** The connection is checked on the same 60-second interval as the telemetry, and every reconnect waits a flat 60 seconds. A silent failure can mean up to about 3 minutes without prices. Checking every few seconds, and starting the backoff short, would recover in under a minute.
 - **No redundancy.** It's one process and one connection, because that's all Polygon allows.
 - **The market calendar needs a yearly update.** It's hardcoded through 2028. If a holiday is missing, the ingester waits for prices that never come, marks itself stale and reconnects about every 2 minutes all day.

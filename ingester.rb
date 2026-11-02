@@ -99,7 +99,7 @@ WRITE_SAMPLE_LOCK = Mutex.new
 def fetch_tickers
   db = nil
   db = PG.connect(PG_OPTS)
-  db.exec('SELECT symbol FROM tickers').map { |row| row['symbol'] }
+  db.exec('SELECT symbol FROM tickers WHERE delisted_at IS NULL').map { |row| row['symbol'] }
 ensure
   db&.close
 end
