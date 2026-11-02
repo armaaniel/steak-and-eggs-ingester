@@ -21,6 +21,7 @@ STALE_AFTER     = 55
 BACKOFF         = 60
 JOIN_TIMEOUT    = 10
 FEED_DELAY      = 900
+REDIS_PAUSE     = 1
 
 TZ = TZInfo::Timezone.get("America/New_York")
 
@@ -40,6 +41,8 @@ PG_OPTS = {
 REDIS_OPTS = {
   url: REDIS_URL,
   ssl: true,
+  connect_timeout: 0.5,
+  reconnect_attempts: 0,
 }.freeze
 
 HOLIDAYS = Set.new(%w[
@@ -226,8 +229,9 @@ loop do
   STATE.last_frame_end_at  = nil
 
   subscriber = Thread.new do
-    redis      = Redis.new(REDIS_OPTS)
-    last_epoch = {}
+    redis        = Redis.new(REDIS_OPTS)
+    last_epoch   = {}
+    paused_until = nil
 
     begin
       client = Polygonio::Websocket::Client.new('stocks', API_KEY, delayed: true)
@@ -244,6 +248,8 @@ loop do
 
         STATE.frames += 1
         STATE.events += message.size
+
+        next if paused_until && now < paused_until
 
         redis.pipelined do |pipe|
           message.each do |data|
@@ -265,10 +271,14 @@ loop do
             end
           end
         end
+        paused_until = nil
 
         finished = Time.now
         STATE.sum_process_ms    += (finished - now) * 1000
         STATE.last_frame_end_at  = finished
+      rescue Redis::BaseConnectionError => e
+        Sentry.capture_exception(e) unless paused_until
+        paused_until = Time.now + REDIS_PAUSE
       end
     rescue => e
       if e.is_a?(Dry::Struct::Error) && e.message.include?('force_disconnect')
