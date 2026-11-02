@@ -70,7 +70,7 @@ Every row carries:
 
 - **Volume.** During regular hours, a typical minute brings 330–410 bars a second. The busiest minute is the last one before the 4 PM close, at up to about 2,450 bars a second, with around 8,000 symbols trading.
 - **Lag.** In a typical minute of regular trading, bars arrive about half a second after the 902-second baseline. A day's worst minute reaches 2–4 seconds.
-- **Headroom.** On a quarter of a vCPU, CPU sits around 11–18% for most of the day. The close is the tight spot: in the minutes before 4 PM, it peaks at 55–88%. That's where a bigger feed would run out first.
+- **Headroom.** On a quarter of a vCPU, CPU sat around 11–18% for most of the day, but the close ran out of room. On Oct 30 it pinned the CPU at 100%, processing flattened at about 1,400 bars a second, and lag reached 73 seconds. It now runs on half a vCPU, sized for the close rather than the average, since it can't scale out.
 - **Polygon disconnects every night.** Just after midnight Eastern, Polygon sends a `force_disconnect`. The ingester records it, waits out the backoff and reconnects. Twice in 30 days, the socket went silent without the message. Silence at night is expected, so the ingester couldn't tell until the session opened at 4 AM, when it marked the connection stale and reconnected within 2 minutes.
 - **Deploys.** The two deploys in the last 30 days left 63 and 80 seconds without prices. The new process had its first message a second after it booted, so nearly all of that gap is ECS stopping the old task and starting the new one.
 
