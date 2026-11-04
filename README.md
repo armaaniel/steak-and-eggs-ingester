@@ -37,7 +37,7 @@ The ingester knows when the feed should be quiet, so a closed market doesn't loo
 ## Telemetry
 
 The ingester never serves a request, so request traces can't see it. It reports on itself instead, by writing rows to the backend's `ingester_samples` table:
-- a **tick** row every 60 seconds
+- a **tick** row on every clock minute (:00), so each tick covers the clock minute before it
 - a **transition** row whenever something happens
 
 Each row records its state, which is one of these:

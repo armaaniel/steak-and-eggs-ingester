@@ -195,7 +195,7 @@ end
 
 Thread.new do
   loop do
-    sleep(SAMPLE_INTERVAL)
+    sleep(SAMPLE_INTERVAL - (Time.now.to_f % SAMPLE_INTERVAL))
     write_sample!
   rescue => e
     Sentry.capture_exception(e)
